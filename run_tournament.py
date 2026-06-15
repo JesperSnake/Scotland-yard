@@ -13,7 +13,6 @@ from mrxbrain import MrXPolicy
 
 ROUNDS = 24
 DETECTIVE_AMOUNT = 4
-DOUBLE_PROBABILITY = 0.1
 MRX_INPUT_SIZE = 108
 MRX_OUTPUT_SIZE = 1866
 DETECTIVE_INPUT_SIZE = 106
@@ -102,7 +101,7 @@ def build_detective_action_tables():
 ) = build_detective_action_tables()
 
 
-def load_policy_weights(path, model, state_dict_key):
+def load_policy_weights(path, model, state_dict_key, strict=True):
     checkpoint = torch.load(path, map_location="cpu")
 
     if isinstance(checkpoint, dict) and state_dict_key in checkpoint:
@@ -112,10 +111,18 @@ def load_policy_weights(path, model, state_dict_key):
     else:
         state_dict = checkpoint
 
-    model.load_state_dict(state_dict)
+    load_result = model.load_state_dict(state_dict, strict=strict)
+    if not strict and (
+        load_result.missing_keys or load_result.unexpected_keys
+    ):
+        print(
+            f"Loaded {path} with strict=False | "
+            f"missing_keys={load_result.missing_keys} "
+            f"unexpected_keys={load_result.unexpected_keys}"
+        )
 
 
-def sample_from_policy(policy_logits, legal_actions, rng):
+def sample_from_policy(policy_logits, legal_actions, rng, greedy=True):
     if legal_actions.size == 0:
         return None
 
@@ -125,6 +132,13 @@ def sample_from_policy(policy_logits, legal_actions, rng):
         device=policy_logits.device,
     )
     legal_logits = policy_logits.reshape(-1)[legal_actions_tensor]
+
+    if greedy:
+        max_logit = legal_logits.max()
+        best_indices = torch.nonzero(legal_logits == max_logit, as_tuple=False).reshape(-1)
+        selected_best_idx = int(best_indices[int(rng.integers(0, len(best_indices)))].item())
+        return int(legal_actions[selected_best_idx])
+
     probs = torch.softmax(legal_logits, dim=0)
     probs_np = probs.detach().cpu().numpy()
 
@@ -132,7 +146,21 @@ def sample_from_policy(policy_logits, legal_actions, rng):
     return int(legal_actions[sampled_index])
 
 
-def sample_action_mrx(policy_logits, current_position, ticket_dict, rng):
+def sample_double_decision(double_logits, rng, greedy=True):
+    if greedy:
+        max_logit = double_logits.reshape(-1).max()
+        best_indices = torch.nonzero(
+            double_logits.reshape(-1) == max_logit,
+            as_tuple=False,
+        ).reshape(-1)
+        return int(best_indices[int(rng.integers(0, len(best_indices)))].item())
+
+    probs = torch.softmax(double_logits.reshape(-1), dim=0)
+    probs_np = probs.detach().cpu().numpy()
+    return int(rng.choice(len(probs_np), p=probs_np))
+
+
+def sample_action_mrx(policy_logits, current_position, ticket_dict, rng, greedy=True):
     if current_position is None:
         return None, None, None, None
 
@@ -153,7 +181,7 @@ def sample_action_mrx(policy_logits, current_position, ticket_dict, rng):
     if legal_actions.size == 0:
         return None, None, None, None
 
-    action_id = sample_from_policy(policy_logits, legal_actions, rng)
+    action_id = sample_from_policy(policy_logits, legal_actions, rng, greedy=greedy)
 
     return (
         int(action_id),
@@ -163,7 +191,14 @@ def sample_action_mrx(policy_logits, current_position, ticket_dict, rng):
     )
 
 
-def sample_action_detective(policy_logits, current_position, ticket_dict, occupied_positions, rng):
+def sample_action_detective(
+    policy_logits,
+    current_position,
+    ticket_dict,
+    occupied_positions,
+    rng,
+    greedy=True,
+):
     if current_position is None:
         return None, None, None
 
@@ -185,7 +220,7 @@ def sample_action_detective(policy_logits, current_position, ticket_dict, occupi
     if legal_actions.size == 0:
         return None, None, None
 
-    action_id = sample_from_policy(policy_logits, legal_actions, rng)
+    action_id = sample_from_policy(policy_logits, legal_actions, rng, greedy=greedy)
 
     return (
         int(action_id),
@@ -194,26 +229,25 @@ def sample_action_detective(policy_logits, current_position, ticket_dict, occupi
     )
 
 
-def move_mr_x(env, mrx_policy_net, device, round_number, rng, used_double=False):
+def move_mr_x(env, mrx_policy_net, device, round_number, rng, used_double=False, greedy=True):
     state = env.mrx_state(round_number)
     input_vector = state_to_input_mrx(state).to(device)
     mrx_pos = state["mr_x_location"]
     mrx_tickets = state["mr_x_tickets"]
 
     with torch.no_grad():
-        policy_logits = mrx_policy_net(input_vector)
+        policy_logits, double_logits = mrx_policy_net(input_vector)
 
-    use_double = (
-        not used_double
-        and mrx_tickets["double"] > 0
-        and rng.random() < DOUBLE_PROBABILITY
-    )
+    use_double = False
+    if not used_double and mrx_tickets["double"] > 0:
+        use_double = sample_double_decision(double_logits, rng, greedy=greedy) == 0
 
     action_id, next_pos, transport, use_black = sample_action_mrx(
         policy_logits,
         mrx_pos,
         mrx_tickets,
         rng,
+        greedy=greedy,
     )
 
     if next_pos is None:
@@ -233,7 +267,15 @@ def move_mr_x(env, mrx_policy_net, device, round_number, rng, used_double=False)
     return action_id, next_pos, transport, use_black, mrx_pos, use_double
 
 
-def move_detective(env, detective_policy_net, device, detective_id, round_number, rng):
+def move_detective(
+    env,
+    detective_policy_net,
+    device,
+    detective_id,
+    round_number,
+    rng,
+    greedy=True,
+):
     state = env.detective_state(
         detective_id=detective_id,
         round=round_number,
@@ -256,6 +298,7 @@ def move_detective(env, detective_policy_net, device, detective_id, round_number
         detective_tickets,
         occupied_positions,
         rng,
+        greedy=greedy,
     )
 
     if next_pos is None:
@@ -271,7 +314,7 @@ def move_detective(env, detective_policy_net, device, detective_id, round_number
     return action_id, next_pos, transport, detective_pos
 
 
-def play_game(env, mrx_policy_net, detective_policy_net, device, rng):
+def play_game(env, mrx_policy_net, detective_policy_net, device, rng, greedy=True):
     env.setup_game()
 
     for round_number in range(ROUNDS):
@@ -288,6 +331,7 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng):
             device,
             round_number,
             rng,
+            greedy=greedy,
         )
 
         if next_pos_mrx is None:
@@ -308,6 +352,7 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng):
                 round_number,
                 rng,
                 used_double=True,
+                greedy=greedy,
             )
 
             if next_pos_mrx is None:
@@ -324,6 +369,7 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng):
                 detective_id,
                 round_number,
                 rng,
+                greedy=greedy,
             )
 
             if next_pos == next_pos_mrx:
@@ -335,7 +381,7 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng):
     return "mrx"
 
 
-def run_tournament(mrx_path, detective_path, games, device, seed=None):
+def run_tournament(mrx_path, detective_path, games, device, seed=None, greedy=True):
     if seed is not None:
         np.random.seed(seed)
 
@@ -345,7 +391,12 @@ def run_tournament(mrx_path, detective_path, games, device, seed=None):
     mrx_policy_net = MrXPolicy(MRX_INPUT_SIZE, HIDDEN_SIZE, MRX_OUTPUT_SIZE).to(device)
     detective_policy_net = DetectivePolicy(DETECTIVE_INPUT_SIZE, HIDDEN_SIZE, DETECTIVE_OUTPUT_SIZE).to(device)
 
-    load_policy_weights(mrx_path, mrx_policy_net, "mrx_policy_state_dict")
+    load_policy_weights(
+        mrx_path,
+        mrx_policy_net,
+        "mrx_policy_state_dict",
+        strict=False,
+    )
     load_policy_weights(detective_path, detective_policy_net, "detective_policy_state_dict")
 
     mrx_policy_net.eval()
@@ -361,6 +412,7 @@ def run_tournament(mrx_path, detective_path, games, device, seed=None):
             detective_policy_net,
             device,
             rng,
+            greedy=greedy,
         )
 
         if winner == "mrx":
@@ -381,6 +433,7 @@ def run_tournament(mrx_path, detective_path, games, device, seed=None):
     print("Tournament Results")
     print(f"Mr X checkpoint: {mrx_path}")
     print(f"Detective checkpoint: {detective_path}")
+    print(f"Policy mode: {'greedy' if greedy else 'sampled'}")
     print(f"Games played: {games}")
     print(f"Mr X wins: {mrx_wins} ({mrx_win_rate:.4%})")
     print(f"Detective wins: {detective_wins} ({detective_win_rate:.4%})")
@@ -417,6 +470,11 @@ def parse_args():
         default=None,
         help="Optional random seed for reproducibility.",
     )
+    parser.add_argument(
+        "--sampled",
+        action="store_true",
+        help="Use stochastic policy sampling instead of greedy action selection.",
+    )
     return parser.parse_args()
 
 
@@ -428,4 +486,5 @@ if __name__ == "__main__":
         games=args.games,
         device=torch.device(args.device),
         seed=args.seed,
+        greedy=not args.sampled,
     )

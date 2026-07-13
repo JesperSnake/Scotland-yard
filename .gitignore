@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+training_artifacts/checkpoints/
+training_artifacts/training_metrics.png

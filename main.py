@@ -8,7 +8,12 @@ import multiprocessing as mp
 import numpy as np
 import os
 import torch
-from helper import state_to_input_detective, state_to_input_mrx
+from helper import (
+    detective_input_dim,
+    mrx_input_dim,
+    state_to_input_detective,
+    state_to_input_mrx,
+)
 from mrxbrain import MrXPolicy, MrXValue
 from detectivebrain import DetectivePolicy, DetectiveValue
 import torch.nn.functional as F
@@ -24,10 +29,10 @@ rng = np.random.default_rng()
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 mrx_out_size = 1866
-mrx_in_size = 108
+mrx_in_size = mrx_input_dim(detective_amount)
 
 detective_out_size = 930
-detective_in_size = 106
+detective_in_size = detective_input_dim(detective_amount)
 
 TRAIN_ITERATIONS = 500
 BUFFER_TARGET_SIZE = 2048
@@ -45,6 +50,9 @@ RECENT_SNAPSHOT_SAMPLE_PROB = 0.7
 PAST_OPPONENT_SNAPSHOT_EVERY = 10
 PAST_OPPONENT_MAX_SNAPSHOTS = 20
 HISTORICAL_SNAPSHOT_CACHE_SIZE = 32
+EARLY_SPECIAL_MOVE_ROUNDS = 3
+EARLY_BLACK_TICKET_PENALTY = 0.02
+EARLY_DOUBLE_MOVE_PENALTY = 0.04
 
 MrXPolicyNet = MrXPolicy(mrx_in_size, 256, mrx_out_size).to(DEVICE)
 MrXValueNet = MrXValue(mrx_in_size, 256, 1).to(DEVICE)
@@ -188,6 +196,65 @@ DETECTIVE_TRANSPORT_NAMES = ("taxi", "bus", "metro")
 # Hot-path function
 # ---------------------------------------------------------------------
 
+def mrx_ticket_array(ticket_dict):
+    return np.asarray(
+        [
+            ticket_dict["taxi"],
+            ticket_dict["bus"],
+            ticket_dict["metro"],
+            ticket_dict["black"],
+        ],
+        dtype=np.int16,
+    )
+
+
+def detective_positions_array():
+    return np.asarray(
+        [int(detective.detective_pos) for detective in env.detectives],
+        dtype=np.int16,
+    )
+
+
+def legal_mrx_action_ids_from_state(position, ticket_array, occupied_positions):
+    candidates = actions_from[int(position)]
+    ticket_mask = ticket_array[action_required_ticket[candidates]] > 0
+    occupied_mask = ~np.isin(action_dst[candidates], occupied_positions)
+    return candidates[ticket_mask & occupied_mask]
+
+
+def has_mrx_followup_after_action(action_id):
+    tickets_after = mrx_ticket_array(env.mrx.mrx_tickets).copy()
+    tickets_after[action_required_ticket[int(action_id)]] -= 1
+    next_position = int(action_dst[int(action_id)])
+    return (
+        legal_mrx_action_ids_from_state(
+            next_position,
+            tickets_after,
+            detective_positions_array(),
+        ).size
+        > 0
+    )
+
+
+def legal_mrx_action_ids(require_double_followup=False):
+    legal_actions = legal_mrx_action_ids_from_state(
+        env.mrx.mrx_pos,
+        mrx_ticket_array(env.mrx.mrx_tickets),
+        detective_positions_array(),
+    )
+    if not require_double_followup:
+        return legal_actions
+
+    if env.move_counter >= rounds - 1:
+        return np.asarray([], dtype=np.int32)
+
+    filtered = [
+        int(action_id)
+        for action_id in legal_actions
+        if has_mrx_followup_after_action(int(action_id))
+    ]
+    return np.asarray(filtered, dtype=np.int32)
+
 def build_action_mask(legal_actions, total_actions, device):
     action_mask = torch.zeros(total_actions, dtype=torch.bool, device=device)
     legal_actions_tensor = torch.as_tensor(
@@ -236,6 +303,18 @@ def sample_double_decision(double_logits):
 
 def create_trajectory():
     return {key: [] for key in TRAJECTORY_KEYS}
+
+
+def compute_mrx_early_special_move_penalty(round_number, use_black=False, use_double=False):
+    if round_number >= EARLY_SPECIAL_MOVE_ROUNDS:
+        return 0.0
+
+    penalty = 0.0
+    if use_black:
+        penalty -= EARLY_BLACK_TICKET_PENALTY
+    if use_double:
+        penalty -= EARLY_DOUBLE_MOVE_PENALTY
+    return penalty
 
 
 def append_transition(trajectory, transition):
@@ -366,6 +445,7 @@ def move_mr_x(
     value_net=None,
     collect_experience=True,
 ):
+    round = env.move_counter if round is None else int(round)
     # Let Mr X play
     state = env.mrx_state(round)
     input_vector = state_to_input_mrx(state)
@@ -382,6 +462,10 @@ def move_mr_x(
             value_net = MrXValueNet if value_net is None else value_net
             value = value_net(network_input).squeeze(-1)
 
+    legal_actions = legal_mrx_action_ids()
+    if legal_actions.size == 0:
+        return None, None, None, None, mrx_pos, False, None
+
     double_available = (
         not used_double
         and mrx_tickets["double"] > 0
@@ -389,16 +473,25 @@ def move_mr_x(
     double_action = 1
     double_log_prob = None
     use_double = False
+    selectable_actions = legal_actions
 
     if double_available:
-        double_action, double_log_prob = sample_double_decision(double_logits)
-        use_double = double_action == 0
+        double_actions = legal_mrx_action_ids(require_double_followup=True)
+        double_available = double_actions.size > 0
+        if double_available:
+            double_action, double_log_prob = sample_double_decision(double_logits)
+            use_double = double_action == 0
+            if use_double:
+                selectable_actions = double_actions
 
-    action_id, next_pos, transport, use_black, log_prob, action_mask = sample_action_mrx(
+    action_id, log_prob, action_mask = sample_from_policy(
         policy_logits,
-        mrx_pos,
-        mrx_tickets,
+        selectable_actions,
+        N_ACTIONS,
     )
+    next_pos = int(action_dst[action_id])
+    transport = TRANSPORT_NAMES[action_transport[action_id]]
+    use_black = bool(action_use_black[action_id])
 
     total_log_prob = None
     if collect_experience and log_prob is not None:
@@ -418,9 +511,6 @@ def move_mr_x(
                           'double_action': int(double_action),
                           'double_mask': bool(double_available)}
 
-    if next_pos is None:
-        return action_id, next_pos, transport, use_black, mrx_pos, False, mrx_experience
-
     env.apply_mrx_move(
         action_id,
         next_pos,
@@ -428,6 +518,13 @@ def move_mr_x(
         use_black,
         round
     )
+
+    if collect_experience and mrx_experience is not None:
+        mrx_experience["reward"] = compute_mrx_early_special_move_penalty(
+            round,
+            use_black=use_black,
+            use_double=use_double,
+        )
 
     if use_double:
         env.mrx.mrx_tickets["double"] -= 1
@@ -443,6 +540,7 @@ def move_detective(
     value_net=None,
     collect_experience=True,
 ):
+    round = env.move_counter if round is None else int(round)
     state = env.detective_state(
         detective_id=detective_id,
         round=round,
@@ -512,7 +610,8 @@ def gather_experience(
     mrx_policy_net = MrXPolicyNet if mrx_policy_net is None else mrx_policy_net
     detective_policy_net = DetectivePolicyNet if detective_policy_net is None else detective_policy_net
 
-    for round in range(rounds):
+    while env.move_counter < rounds:
+        round = env.move_counter
 
         action_id, next_pos_mrx, transport, use_black, mrx_pos, use_double, mrx_experience = move_mr_x(
             round,
@@ -530,7 +629,7 @@ def gather_experience(
         # This runs if mrx used double card
         if use_double:
             action_id, next_pos_mrx, transport, use_black, mrx_pos, _, mrx_experience = move_mr_x(
-                round,
+                env.move_counter,
                 True,
                 policy_net=mrx_policy_net,
                 value_net=mrx_value_net,
@@ -542,9 +641,9 @@ def gather_experience(
                     print("Mr X lost, no legal moves available during double move")
                 return -1, mrx_trajectory, detective_trajectory
 
-        if round == rounds - 1:
+        if env.move_counter >= rounds:
             if rollout_debug:
-                print("Mr X reached round 24 and wins immediately")
+                print("Mr X reached move 24 and wins immediately")
             return 1, mrx_trajectory, detective_trajectory
 
 
@@ -552,7 +651,7 @@ def gather_experience(
         for detective_id in range(detective_amount):
             action_id, next_pos, transport, detective_pos, detective_experience = move_detective(
                 detective_id,
-                round,
+                env.move_counter,
                 policy_net=detective_policy_net,
                 value_net=detective_value_net,
                 collect_experience=collect_detective,
@@ -565,8 +664,8 @@ def gather_experience(
             
             if next_pos is None:
                 if rollout_debug:
-                    print(f"Detective {detective_id} has no legal moves on round {round}")
-                return 1, mrx_trajectory, detective_trajectory
+                    print(f"Detective {detective_id} has no legal moves on move {env.move_counter}")
+                continue
     return 1, mrx_trajectory, detective_trajectory
 
 
@@ -616,14 +715,66 @@ def state_dict_to_cpu(model):
     }
 
 
+def load_compatible_state_dict(model, state_dict, label):
+    model_state = model.state_dict()
+    compatible_state_dict = {}
+    skipped_keys = []
+    unexpected_keys = []
+
+    for key, value in state_dict.items():
+        if key not in model_state:
+            unexpected_keys.append(key)
+            continue
+
+        if model_state[key].shape != value.shape:
+            skipped_keys.append(
+                (
+                    key,
+                    tuple(value.shape),
+                    tuple(model_state[key].shape),
+                )
+            )
+            continue
+
+        compatible_state_dict[key] = value
+
+    load_result = model.load_state_dict(compatible_state_dict, strict=False)
+
+    if skipped_keys:
+        skipped_summary = ", ".join(
+            f"{key}: ckpt{checkpoint_shape} != model{model_shape}"
+            for key, checkpoint_shape, model_shape in skipped_keys
+        )
+        print(f"{label} skipped incompatible tensors: {skipped_summary}")
+
+    if unexpected_keys:
+        print(f"{label} had unexpected keys: {unexpected_keys}")
+
+    missing_keys = [
+        key
+        for key in model_state.keys()
+        if key not in compatible_state_dict
+    ]
+    if missing_keys:
+        print(f"{label} left model tensors at init values: {missing_keys}")
+
+    return not skipped_keys and not unexpected_keys and not load_result.missing_keys
+
+
 def load_mrx_policy_state_dict(model, state_dict):
-    load_result = model.load_state_dict(state_dict, strict=False)
-    if load_result.unexpected_keys:
-        print(f"Mr X policy had unexpected keys: {load_result.unexpected_keys}")
+    return load_compatible_state_dict(model, state_dict, "Mr X policy")
 
 
 def load_detective_policy_state_dict(model, state_dict):
-    model.load_state_dict(state_dict)
+    return load_compatible_state_dict(model, state_dict, "Detective policy")
+
+
+def load_mrx_value_state_dict(model, state_dict):
+    return load_compatible_state_dict(model, state_dict, "Mr X value")
+
+
+def load_detective_value_state_dict(model, state_dict):
+    return load_compatible_state_dict(model, state_dict, "Detective value")
 
 
 def move_optimizer_to_device(optimizer, device):
@@ -709,33 +860,50 @@ def load_training_checkpoint(
 ):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-    load_mrx_policy_state_dict(MrXPolicyNet, checkpoint["mrx_policy_state_dict"])
-    MrXValueNet.load_state_dict(checkpoint["mrx_value_state_dict"])
-    load_detective_policy_state_dict(
+    mrx_policy_compatible = load_mrx_policy_state_dict(
+        MrXPolicyNet,
+        checkpoint["mrx_policy_state_dict"],
+    )
+    mrx_value_compatible = load_mrx_value_state_dict(
+        MrXValueNet,
+        checkpoint["mrx_value_state_dict"],
+    )
+    detective_policy_compatible = load_detective_policy_state_dict(
         DetectivePolicyNet,
         checkpoint["detective_policy_state_dict"],
     )
-    DetectiveValueNet.load_state_dict(checkpoint["detective_value_state_dict"])
+    detective_value_compatible = load_detective_value_state_dict(
+        DetectiveValueNet,
+        checkpoint["detective_value_state_dict"],
+    )
 
-    if "mrx_policy_optimizer_state_dict" in checkpoint:
+    if mrx_policy_compatible and "mrx_policy_optimizer_state_dict" in checkpoint:
         mrx_policy_optimizer.load_state_dict(checkpoint["mrx_policy_optimizer_state_dict"])
         move_optimizer_to_device(mrx_policy_optimizer, device)
+    elif "mrx_policy_optimizer_state_dict" in checkpoint:
+        print("Skipped Mr X policy optimizer state because model tensors were only partially loaded.")
 
-    if "mrx_value_optimizer_state_dict" in checkpoint:
+    if mrx_value_compatible and "mrx_value_optimizer_state_dict" in checkpoint:
         mrx_value_optimizer.load_state_dict(checkpoint["mrx_value_optimizer_state_dict"])
         move_optimizer_to_device(mrx_value_optimizer, device)
+    elif "mrx_value_optimizer_state_dict" in checkpoint:
+        print("Skipped Mr X value optimizer state because model tensors were only partially loaded.")
 
-    if "detective_policy_optimizer_state_dict" in checkpoint:
+    if detective_policy_compatible and "detective_policy_optimizer_state_dict" in checkpoint:
         detective_policy_optimizer.load_state_dict(
             checkpoint["detective_policy_optimizer_state_dict"]
         )
         move_optimizer_to_device(detective_policy_optimizer, device)
+    elif "detective_policy_optimizer_state_dict" in checkpoint:
+        print("Skipped detective policy optimizer state because model tensors were only partially loaded.")
 
-    if "detective_value_optimizer_state_dict" in checkpoint:
+    if detective_value_compatible and "detective_value_optimizer_state_dict" in checkpoint:
         detective_value_optimizer.load_state_dict(
             checkpoint["detective_value_optimizer_state_dict"]
         )
         move_optimizer_to_device(detective_value_optimizer, device)
+    elif "detective_value_optimizer_state_dict" in checkpoint:
+        print("Skipped detective value optimizer state because model tensors were only partially loaded.")
 
     return {
         "iteration": int(checkpoint.get("iteration", 0)),
@@ -913,12 +1081,12 @@ def collect_self_play_worker(task):
     rng = np.random.default_rng(worker_seed)
 
     load_mrx_policy_state_dict(MrXPolicyNet, mrx_policy_state_dict)
-    MrXValueNet.load_state_dict(mrx_value_state_dict)
+    load_mrx_value_state_dict(MrXValueNet, mrx_value_state_dict)
     load_detective_policy_state_dict(
         DetectivePolicyNet,
         detective_policy_state_dict,
     )
-    DetectiveValueNet.load_state_dict(detective_value_state_dict)
+    load_detective_value_state_dict(DetectiveValueNet, detective_value_state_dict)
 
     MrXPolicyNet.eval()
     MrXValueNet.eval()

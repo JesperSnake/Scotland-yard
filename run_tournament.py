@@ -7,17 +7,23 @@ import torch
 from detectivebrain import DetectivePolicy
 from env import environment
 from game_constants import board_graph
-from helper import state_to_input_detective, state_to_input_mrx
+from helper import (
+    detective_input_dim,
+    mrx_input_dim,
+    state_to_input_detective,
+    state_to_input_mrx,
+)
 from mrxbrain import MrXPolicy
 
 
 ROUNDS = 24
 DETECTIVE_AMOUNT = 4
-MRX_INPUT_SIZE = 108
+MRX_INPUT_SIZE = mrx_input_dim(DETECTIVE_AMOUNT)
 MRX_OUTPUT_SIZE = 1866
-DETECTIVE_INPUT_SIZE = 106
+DETECTIVE_INPUT_SIZE = detective_input_dim(DETECTIVE_AMOUNT)
 DETECTIVE_OUTPUT_SIZE = 930
 HIDDEN_SIZE = 256
+GAME_SEED_MAX = int(np.iinfo(np.uint32).max)
 
 TRANSPORT_TO_INT = {
     "taxi": 0,
@@ -101,6 +107,16 @@ def build_detective_action_tables():
 ) = build_detective_action_tables()
 
 
+def build_game_rng(game_seed):
+    game_seed = int(game_seed)
+    np.random.seed(game_seed)
+    return np.random.default_rng(game_seed)
+
+
+def sample_game_seed(master_rng):
+    return int(master_rng.integers(0, GAME_SEED_MAX + 1, dtype=np.uint64))
+
+
 def load_policy_weights(path, model, state_dict_key, strict=True):
     checkpoint = torch.load(path, map_location="cpu")
 
@@ -111,15 +127,54 @@ def load_policy_weights(path, model, state_dict_key, strict=True):
     else:
         state_dict = checkpoint
 
-    load_result = model.load_state_dict(state_dict, strict=strict)
-    if not strict and (
-        load_result.missing_keys or load_result.unexpected_keys
-    ):
-        print(
-            f"Loaded {path} with strict=False | "
-            f"missing_keys={load_result.missing_keys} "
-            f"unexpected_keys={load_result.unexpected_keys}"
+    model_state = model.state_dict()
+    compatible_state_dict = {}
+    skipped_keys = []
+    unexpected_keys = []
+
+    for key, value in state_dict.items():
+        if key not in model_state:
+            unexpected_keys.append(key)
+            continue
+
+        if model_state[key].shape != value.shape:
+            skipped_keys.append(
+                (
+                    key,
+                    tuple(value.shape),
+                    tuple(model_state[key].shape),
+                )
+            )
+            continue
+
+        compatible_state_dict[key] = value
+
+    load_result = model.load_state_dict(compatible_state_dict, strict=False)
+    missing_keys = [
+        key
+        for key in model_state.keys()
+        if key not in compatible_state_dict
+    ]
+
+    if strict and (skipped_keys or unexpected_keys or missing_keys):
+        raise ValueError(
+            f"Checkpoint {path} is incompatible with the current model shape. "
+            f"skipped_keys={skipped_keys}, unexpected_keys={unexpected_keys}, "
+            f"missing_keys={missing_keys}"
         )
+
+    if skipped_keys or unexpected_keys or missing_keys:
+        print(f"Loaded {path} with partial parameter reuse.")
+        if skipped_keys:
+            skipped_summary = ", ".join(
+                f"{key}: ckpt{checkpoint_shape} != model{model_shape}"
+                for key, checkpoint_shape, model_shape in skipped_keys
+            )
+            print(f"  skipped incompatible tensors: {skipped_summary}")
+        if unexpected_keys:
+            print(f"  unexpected keys: {unexpected_keys}")
+        if missing_keys or load_result.missing_keys:
+            print(f"  left at init values: {missing_keys}")
 
 
 def sample_from_policy(policy_logits, legal_actions, rng, greedy=True):
@@ -158,6 +213,91 @@ def sample_double_decision(double_logits, rng, greedy=True):
     probs = torch.softmax(double_logits.reshape(-1), dim=0)
     probs_np = probs.detach().cpu().numpy()
     return int(rng.choice(len(probs_np), p=probs_np))
+
+
+def mrx_ticket_array(ticket_dict):
+    return np.asarray(
+        [
+            ticket_dict["taxi"],
+            ticket_dict["bus"],
+            ticket_dict["metro"],
+            ticket_dict["black"],
+        ],
+        dtype=np.int16,
+    )
+
+
+def detective_ticket_array(ticket_dict):
+    return np.asarray(
+        [
+            ticket_dict["taxi"],
+            ticket_dict["bus"],
+            ticket_dict["metro"],
+        ],
+        dtype=np.int16,
+    )
+
+
+def detective_positions(env):
+    return np.asarray(
+        [int(detective.detective_pos) for detective in env.detectives],
+        dtype=np.int16,
+    )
+
+
+def legal_mrx_action_ids_from_state(position, ticket_array, occupied_positions):
+    candidates = MRX_ACTIONS_FROM[int(position)]
+    ticket_mask = ticket_array[MRX_ACTION_REQUIRED_TICKET[candidates]] > 0
+    occupied_mask = ~np.isin(MRX_ACTION_DST[candidates], occupied_positions)
+    return candidates[ticket_mask & occupied_mask]
+
+
+def has_mrx_followup_after_action(env, action_id):
+    tickets_after = mrx_ticket_array(env.mrx.mrx_tickets).copy()
+    tickets_after[MRX_ACTION_REQUIRED_TICKET[int(action_id)]] -= 1
+    next_position = int(MRX_ACTION_DST[int(action_id)])
+    return (
+        legal_mrx_action_ids_from_state(
+            next_position,
+            tickets_after,
+            detective_positions(env),
+        ).size
+        > 0
+    )
+
+
+def legal_mrx_action_ids(env, require_double_followup=False):
+    legal_actions = legal_mrx_action_ids_from_state(
+        env.mrx.mrx_pos,
+        mrx_ticket_array(env.mrx.mrx_tickets),
+        detective_positions(env),
+    )
+    if not require_double_followup:
+        return legal_actions
+
+    if env.move_counter >= ROUNDS - 1:
+        return np.asarray([], dtype=np.int32)
+
+    filtered = [
+        int(action_id)
+        for action_id in legal_actions
+        if has_mrx_followup_after_action(env, int(action_id))
+    ]
+    return np.asarray(filtered, dtype=np.int32)
+
+
+def legal_detective_action_ids(env, detective_id):
+    current_detective = env.detectives[detective_id]
+    candidates = DETECTIVE_ACTIONS_FROM[int(current_detective.detective_pos)]
+    tickets = detective_ticket_array(current_detective.detective_tickets)
+    ticket_mask = tickets[DETECTIVE_ACTION_REQUIRED_TICKET[candidates]] > 0
+    occupied_positions = [
+        int(env.detectives[other_id].detective_pos)
+        for other_id in range(DETECTIVE_AMOUNT)
+        if other_id != detective_id
+    ]
+    occupied_mask = ~np.isin(DETECTIVE_ACTION_DST[candidates], occupied_positions)
+    return candidates[ticket_mask & occupied_mask]
 
 
 def sample_action_mrx(policy_logits, current_position, ticket_dict, rng, greedy=True):
@@ -230,6 +370,7 @@ def sample_action_detective(
 
 
 def move_mr_x(env, mrx_policy_net, device, round_number, rng, used_double=False, greedy=True):
+    round_number = env.move_counter if round_number is None else int(round_number)
     state = env.mrx_state(round_number)
     input_vector = state_to_input_mrx(state).to(device)
     mrx_pos = state["mr_x_location"]
@@ -238,20 +379,28 @@ def move_mr_x(env, mrx_policy_net, device, round_number, rng, used_double=False,
     with torch.no_grad():
         policy_logits, double_logits = mrx_policy_net(input_vector)
 
-    use_double = False
-    if not used_double and mrx_tickets["double"] > 0:
-        use_double = sample_double_decision(double_logits, rng, greedy=greedy) == 0
+    legal_actions = legal_mrx_action_ids(env)
+    if legal_actions.size == 0:
+        return None, None, None, None, mrx_pos, False
 
-    action_id, next_pos, transport, use_black = sample_action_mrx(
+    use_double = False
+    selectable_actions = legal_actions
+    if not used_double and mrx_tickets["double"] > 0:
+        double_actions = legal_mrx_action_ids(env, require_double_followup=True)
+        if double_actions.size > 0:
+            use_double = sample_double_decision(double_logits, rng, greedy=greedy) == 0
+            if use_double:
+                selectable_actions = double_actions
+
+    action_id = sample_from_policy(
         policy_logits,
-        mrx_pos,
-        mrx_tickets,
+        selectable_actions,
         rng,
         greedy=greedy,
     )
-
-    if next_pos is None:
-        return action_id, next_pos, transport, use_black, mrx_pos, False
+    next_pos = int(MRX_ACTION_DST[action_id])
+    transport = TRANSPORT_NAMES[int(MRX_ACTION_TRANSPORT[action_id])]
+    use_black = bool(MRX_ACTION_USE_BLACK[action_id])
 
     env.apply_mrx_move(
         action_id,
@@ -276,6 +425,7 @@ def move_detective(
     rng,
     greedy=True,
 ):
+    round_number = env.move_counter if round_number is None else int(round_number)
     state = env.detective_state(
         detective_id=detective_id,
         round=round_number,
@@ -283,26 +433,22 @@ def move_detective(
     input_vector = state_to_input_detective(state).to(device)
     detective_tickets = state["my_tickets"]
     detective_pos = state["my_position"]
-    occupied_positions = [
-        state["detective_locations"][j]
-        for j in range(DETECTIVE_AMOUNT)
-        if j != detective_id
-    ]
+    legal_actions = legal_detective_action_ids(env, detective_id)
 
     with torch.no_grad():
         policy_logits = detective_policy_net(input_vector)
 
-    action_id, next_pos, transport = sample_action_detective(
+    if legal_actions.size == 0:
+        return None, None, None, detective_pos
+
+    action_id = sample_from_policy(
         policy_logits,
-        detective_pos,
-        detective_tickets,
-        occupied_positions,
+        legal_actions,
         rng,
         greedy=greedy,
     )
-
-    if next_pos is None:
-        return action_id, next_pos, transport, detective_pos
+    next_pos = int(DETECTIVE_ACTION_DST[action_id])
+    transport = DETECTIVE_TRANSPORT_NAMES[int(DETECTIVE_ACTION_TRANSPORT[action_id])]
 
     env.apply_detective_move(
         detective_id,
@@ -317,7 +463,7 @@ def move_detective(
 def play_game(env, mrx_policy_net, detective_policy_net, device, rng, greedy=True):
     env.setup_game()
 
-    for round_number in range(ROUNDS):
+    while env.move_counter < ROUNDS:
         (
             _action_id,
             next_pos_mrx,
@@ -329,7 +475,7 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng, greedy=Tru
             env,
             mrx_policy_net,
             device,
-            round_number,
+            env.move_counter,
             rng,
             greedy=greedy,
         )
@@ -349,7 +495,7 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng, greedy=Tru
                 env,
                 mrx_policy_net,
                 device,
-                round_number,
+                env.move_counter,
                 rng,
                 used_double=True,
                 greedy=greedy,
@@ -358,7 +504,7 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng, greedy=Tru
             if next_pos_mrx is None:
                 return "detective"
 
-        if round_number == ROUNDS - 1:
+        if env.move_counter >= ROUNDS:
             return "mrx"
 
         for detective_id in range(DETECTIVE_AMOUNT):
@@ -367,7 +513,7 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng, greedy=Tru
                 detective_policy_net,
                 device,
                 detective_id,
-                round_number,
+                env.move_counter,
                 rng,
                 greedy=greedy,
             )
@@ -376,16 +522,13 @@ def play_game(env, mrx_policy_net, detective_policy_net, device, rng, greedy=Tru
                 return "detective"
 
             if next_pos is None:
-                return "mrx"
+                continue
 
     return "mrx"
 
 
 def run_tournament(mrx_path, detective_path, games, device, seed=None, greedy=True):
-    if seed is not None:
-        np.random.seed(seed)
-
-    rng = np.random.default_rng(seed)
+    master_rng = np.random.default_rng(seed)
     env = environment(DETECTIVE_AMOUNT)
 
     mrx_policy_net = MrXPolicy(MRX_INPUT_SIZE, HIDDEN_SIZE, MRX_OUTPUT_SIZE).to(device)
@@ -397,28 +540,40 @@ def run_tournament(mrx_path, detective_path, games, device, seed=None, greedy=Tr
         "mrx_policy_state_dict",
         strict=False,
     )
-    load_policy_weights(detective_path, detective_policy_net, "detective_policy_state_dict")
+    load_policy_weights(
+        detective_path,
+        detective_policy_net,
+        "detective_policy_state_dict",
+        strict=False,
+    )
 
     mrx_policy_net.eval()
     detective_policy_net.eval()
 
     mrx_wins = 0
     detective_wins = 0
+    example_mrx_seed = None
+    example_detective_seed = None
 
     for game_idx in range(1, games + 1):
+        game_seed = sample_game_seed(master_rng)
         winner = play_game(
             env,
             mrx_policy_net,
             detective_policy_net,
             device,
-            rng,
+            build_game_rng(game_seed),
             greedy=greedy,
         )
 
         if winner == "mrx":
             mrx_wins += 1
+            if example_mrx_seed is None:
+                example_mrx_seed = game_seed
         else:
             detective_wins += 1
+            if example_detective_seed is None:
+                example_detective_seed = game_seed
 
         if game_idx % 1000 == 0 or game_idx == games:
             print(
@@ -434,9 +589,22 @@ def run_tournament(mrx_path, detective_path, games, device, seed=None, greedy=Tr
     print(f"Mr X checkpoint: {mrx_path}")
     print(f"Detective checkpoint: {detective_path}")
     print(f"Policy mode: {'greedy' if greedy else 'sampled'}")
+    print(f"Tournament seed: {seed if seed is not None else 'random'}")
     print(f"Games played: {games}")
     print(f"Mr X wins: {mrx_wins} ({mrx_win_rate:.4%})")
     print(f"Detective wins: {detective_wins} ({detective_win_rate:.4%})")
+    print(
+        "Example Mr X-winning seed: "
+        + (str(example_mrx_seed) if example_mrx_seed is not None else "none found")
+    )
+    print(
+        "Example detective-winning seed: "
+        + (
+            str(example_detective_seed)
+            if example_detective_seed is not None
+            else "none found"
+        )
+    )
 
 
 def parse_args():
@@ -468,7 +636,9 @@ def parse_args():
         "--seed",
         type=int,
         default=None,
-        help="Optional random seed for reproducibility.",
+        help=(
+            "Optional tournament seed used to generate one reproducible seed per game."
+        ),
     )
     parser.add_argument(
         "--sampled",

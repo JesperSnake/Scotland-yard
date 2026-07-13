@@ -28,6 +28,7 @@ class environment():
         self.detectives = []
         self.last_reveal_location = None
         self.last_reveal_round = 0
+        self.move_counter = 0
 
     def setup_game(self):
         self.detectives = []
@@ -36,6 +37,7 @@ class environment():
         self.mrx = MrX(start_pos)
         self.last_reveal_location = start_pos
         self.last_reveal_round = 0
+        self.move_counter = 0
         #Initiate detectives
         detective_positions = np.random.choice(
         detective_start_positions,
@@ -45,9 +47,30 @@ class environment():
             new_detective = Detective(int(detective_positions[i]))
             self.detectives.append(new_detective)
 
-    def mrx_state(self, round):
+    def setup_custom_game(self, mrx_start_pos, detective_positions):
+        detective_positions = [int(position) for position in detective_positions]
+        if len(detective_positions) != self.detective_amount:
+            raise ValueError(
+                f"Expected {self.detective_amount} detective positions, "
+                f"got {len(detective_positions)}.",
+            )
+
+        self.detectives = []
+        self.mrx = MrX(int(mrx_start_pos))
+        self.last_reveal_location = int(mrx_start_pos)
+        self.last_reveal_round = 0
+        self.move_counter = 0
+
+        for position in detective_positions:
+            self.detectives.append(Detective(position))
+
+    def mrx_state(self, round=None):
+        if round is None:
+            round = self.move_counter
+
+        round = int(round)
         return {
-            "round": int(round),
+            "round": round,
             "mr_x_location": int(self.mrx.mrx_pos),
             "mr_x_tickets": self.mrx.mrx_tickets.copy(),
             "mr_x_ticket_history": self.mrx.ticket_history.copy(),
@@ -58,10 +81,14 @@ class environment():
         }
 
         
-    def detective_state(self, detective_id, round):
+    def detective_state(self, detective_id, round=None):
+        if round is None:
+            round = self.move_counter
+
+        round = int(round)
         current_detective = self.detectives[detective_id]
         return {
-            "round": int(round),
+            "round": round,
             "detective_id": int(detective_id),
             "my_position": int(current_detective.detective_pos),
             "my_tickets": current_detective.detective_tickets.copy(),
@@ -72,7 +99,11 @@ class environment():
             "moves_since_last_reveal": int(round - self.last_reveal_round),
         }
 
-    def apply_mrx_move(self, action_id, next_pos, transport, use_black, round):
+    def apply_mrx_move(self, action_id, next_pos, transport, use_black, round=None):
+        if round is None:
+            round = self.move_counter
+
+        round = int(round)
         next_pos = int(next_pos)
         ticket_used = "black" if use_black else transport
 
@@ -83,11 +114,12 @@ class environment():
 
         if (round + 1) in reveal_rounds:
             self.last_reveal_location = next_pos
-            self.last_reveal_round = int(round)
+            self.last_reveal_round = int(round) + 1
             self.mrx.ticket_history = []
         else:
             self.mrx.ticket_history.append(ticket_used)
         self.mrx.mrx_pos = next_pos
+        self.move_counter = round + 1
         
 
 
@@ -96,5 +128,3 @@ class environment():
         current_detective.detective_pos = next_pos
         current_detective.detective_tickets[transport] -= 1
         self.mrx.mrx_tickets[transport] += 1
-
-

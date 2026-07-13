@@ -1,41 +1,44 @@
 import numpy as np
 import torch
-from game_constants import reveal_rounds
-import numpy as np
+
+from game_constants import board_graph, reveal_rounds
 """
 Feature layout reference
 ========================
 
 Mr. X encoder
 - round context: 3
-- Mr. X position: 1
+- Mr. X position one-hot: 199
 - Mr. X ticket inventory (count/has/exhausted for 5 ticket types): 15
-- detective locations: N
+- detective locations (ordered one-hot per detective): 199 * N
+- detective occupancy map: 199
 - detective ticket inventories (count/has/exhausted for 3 ticket types each): 9 * N
 - Mr. X history sequence (6 slots * 6 one-hot values): 36
 - Mr. X history histogram: 5
 - most recent history ticket one-hot: 6
-- last reveal position: 1
+- last reveal position one-hot: 199
 - moves since reveal: 1
-- total: 68 + 10 * N
+- total: 663 + 208 * N
 
 Detective encoder
 - round context: 3
 - detective id one-hot: N
-- own position: 1
+- own position one-hot: 199
 - own ticket inventory (count/has/exhausted for 3 ticket types): 9
-- all detective locations: N
+- all detective locations (ordered one-hot per detective): 199 * N
+- detective occupancy map: 199
 - detective ticket inventories (count/has/exhausted for 3 ticket types each): 9 * N
 - Mr. X history sequence (6 slots * 6 one-hot values): 36
 - Mr. X history histogram: 5
 - most recent history ticket one-hot: 6
-- Mr. X last revealed position: 1
+- Mr. X last revealed position one-hot: 199
 - moves since last reveal: 1
-- total: 62 + 11 * N
+- possible Mr. X location map: 199
+- total: 856 + 209 * N
 
 With 4 detectives:
-- Mr. X input size: 108
-- detective input size: 106
+- Mr. X input size: 1495
+- detective input size: 1692
 """
 
 
@@ -91,10 +94,24 @@ class FeatureBuilder:
         self._parts.append(vec)
 
     def position(self, node):
-        self.scalar(node, NUM_NODES)
+        vec = np.zeros(NUM_NODES, dtype=np.float32)
+        if node is not None and 1 <= node <= NUM_NODES:
+            vec[node - 1] = 1.0
+        self._parts.append(vec)
 
     def positions(self, nodes):
-        self._parts.append(np.asarray(nodes, dtype=np.float32) / NUM_NODES)
+        for node in nodes:
+            self.position(node)
+
+    def occupancy(self, nodes):
+        vec = np.zeros(NUM_NODES, dtype=np.float32)
+        for node in nodes:
+            if node is not None and 1 <= node <= NUM_NODES:
+                vec[node - 1] = 1.0
+        self._parts.append(vec)
+
+    def node_mask(self, nodes):
+        self.occupancy(nodes)
 
     def ticket_inventory(self, ticket_dict, max_tickets, ticket_order):
         counts = np.asarray(
@@ -159,6 +176,60 @@ def _add_round_context(builder, round_number):
     builder.binary(current_move in reveal_rounds)
 
 
+def _transport_neighbors(node, ticket):
+    edges = board_graph.get(node, {})
+    if ticket == "black":
+        neighbors = []
+        for transport in ("taxi", "bus", "metro", "water"):
+            neighbors.extend(edges.get(transport, []))
+        return neighbors
+
+    return edges.get(ticket, [])
+
+
+def compute_mrx_belief_nodes(
+    last_reveal_location,
+    ticket_history,
+    detective_locations,
+):
+    """Approximate current possible Mr. X locations from public information.
+
+    We only know the current detective positions, not the full detective move
+    history since the last reveal, so we expand by ticket history and then
+    remove currently occupied detective nodes from the final candidate set.
+    """
+    if last_reveal_location is None:
+        return set()
+
+    possible_nodes = {int(last_reveal_location)}
+    for ticket in ticket_history:
+        next_nodes = set()
+        for node in possible_nodes:
+            for neighbor in _transport_neighbors(node, ticket):
+                next_nodes.add(int(neighbor))
+        possible_nodes = next_nodes
+        if not possible_nodes:
+            break
+
+    occupied_nodes = {
+        int(node)
+        for node in detective_locations
+        if node is not None
+    }
+    return {
+        node for node in possible_nodes
+        if 1 <= node <= NUM_NODES and node not in occupied_nodes
+    }
+
+
+def mrx_input_dim(num_detectives):
+    return 663 + 208 * num_detectives
+
+
+def detective_input_dim(num_detectives):
+    return 856 + 209 * num_detectives
+
+
 def state_to_input_detective(state):
     """Encode detective state into a flat float32 torch tensor."""
     builder = FeatureBuilder()
@@ -173,10 +244,18 @@ def state_to_input_detective(state):
         DETECTIVE_TICKET_ORDER,
     )
     builder.positions(state["detective_locations"])
+    builder.occupancy(state["detective_locations"])
     builder.detective_ticket_table(state["detective_tickets"])
     builder.ticket_history(state["mr_x_ticket_history"])
     builder.position(state["mr_x_last_revealed_position"])
     builder.scalar(state["moves_since_last_reveal"], MAX_REVEAL_GAP)
+    builder.node_mask(
+        compute_mrx_belief_nodes(
+            state["mr_x_last_revealed_position"],
+            state["mr_x_ticket_history"],
+            state["detective_locations"],
+        )
+    )
 
     return builder.build()
 
@@ -193,6 +272,7 @@ def state_to_input_mrx(state):
         MRX_TICKET_ORDER,
     )
     builder.positions(state["detective_locations"])
+    builder.occupancy(state["detective_locations"])
     builder.detective_ticket_table(state["detective_tickets"])
     builder.ticket_history(state["mr_x_ticket_history"])
     builder.position(state["last_reveal_location"])
